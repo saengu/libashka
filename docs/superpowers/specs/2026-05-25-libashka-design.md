@@ -10,7 +10,7 @@ libashka compiles Babashka into a C-linkable shared dynamic library using GraalV
 
 ### 1.1 Output Artifacts
 
-| Platform | Shared Library | 
+| Platform | Shared Library |
 |----------|---------------|
 | Linux x86_64 / arm64 | `libbabashka.so` |
 | macOS x86_64 / arm64 | `libbabashka.dylib` |
@@ -21,11 +21,12 @@ Public header: `include/libbabashka.h`
 ### 1.2 Key Design Decisions
 
 - **Integration**: Git submodule of babashka (not a fork), inheriting its entire build pipeline
-- **Isolate model**: Per-thread independent GraalVM Isolates, managed via `ConcurrentHashMap`
+- **Isolate model**: Per-thread independent GraalVM Isolates. Each Isolate owns a private SCI context and host-fn registry — no cross-Isolate shared state
+- **Isolate lifecycle**: C host creates Isolates via `libashka_create_context`, passes `graal_isolatet_t*` to every subsequent call. GraalVM routes each `@CEntryPoint` invocation to the correct Isolate automatically
 - **Data exchange**: JSON strings across the FFI boundary via `cheshire.core`
 - **Callbacks**: `@CFunctionPointer` + `@InvokeCFunctionPointer`, JSON-in / JSON-out
 - **Build flow**: `babashka uberjar → native-image --shared → libbabashka.so`
-- **Pod support**: Full — preserves `babashka.pods` namespace and subprocess management
+- **Pod support**: Full — preserves `babashka.pods` namespace and subprocess management, with mandatory child-process cleanup on context destroy
 
 ## 2. Directory Structure
 
@@ -36,10 +37,10 @@ libashka/
 │
 ├── src/java/libashka/
 │   ├── LibashkaStructs.java        ← @CStruct 映射 libashka_val_t
-│   └── LibashkaAPI.java            ← @CEntryPoint 导出函数（6个）
+│   └── LibashkaAPI.java            ← @CEntryPoint 导出函数
 │
 ├── src/clojure/libashka/
-│   ├── core.clj                    ← SCI 上下文生命周期管理
+│   ├── core.clj                    ← SCI 上下文生命周期管理 + Pod 子进程追踪
 │   ├── serialization.clj           ← JSON 序列化/反序列化（cheshire）
 │   ├── callbacks.clj               ← 宿主回调注册与调用调度
 │   └── build.clj                   ← native-image 构建脚本
@@ -50,7 +51,7 @@ libashka/
 ├── test/
 │   ├── clojure/
 │   │   └── libashka/
-│   │       ├── core_test.clj       ← 上下文创建/销毁/求值
+│   │       ├── core_test.clj       ← 上下文创建/销毁/求值/子进程清理
 │   │       ├── serialization_test.clj
 │   │       ├── callbacks_test.clj
 │   │       └── pod_test.clj        ← Pod 功能测试
@@ -78,7 +79,9 @@ libashka/
 ### 3.1 Types
 
 ```c
-/* Opaque context handle — one per thread/Isolate */
+/* Opaque context handle — wraps a GraalVM graal_isolatet_t*.
+   The C host passes this pointer to every API call so that
+   GraalVM can route the invocation to the correct Isolate. */
 typedef struct libashka_ctx libashka_ctx_t;
 
 /* Value type tags */
@@ -88,7 +91,8 @@ typedef enum {
     LIBASHKA_FLOAT64 = 2,
     LIBASHKA_BOOLEAN = 3,
     LIBASHKA_STRING  = 4,
-    LIBASHKA_JSON    = 5    /* Composite types serialized as JSON */
+    LIBASHKA_JSON    = 5,   /* Composite types serialized as JSON */
+    LIBASHKA_BINARY  = 6    /* Reserved: binary serialization (Transit, MessagePack) */
 } libashka_type_t;
 
 /* Tagged union for return values */
@@ -99,6 +103,10 @@ typedef struct {
         double   f64;
         int32_t  boolean;
         char    *string;    /* Caller must free via libashka_free_value */
+        struct {
+            uint8_t *data;
+            size_t   len;   /* Caller must free via libashka_free_value */
+        } binary;
     } value;
 } libashka_val_t;
 
@@ -106,25 +114,73 @@ typedef struct {
 typedef char *(*libashka_host_fn_t)(const char *json_args);
 ```
 
-### 3.2 API Functions
+### 3.2 Capability Flags
+
+```c
+/* Bitmask controlling which features are available to a context.
+   Host applications use these to sandbox untrusted scripts. */
+typedef enum {
+    LIBASHKA_CAP_POD         = 1 << 0,  /* Pod loading and external subprocesses */
+    LIBASHKA_CAP_SHELL       = 1 << 1,  /* shell/sh execution */
+    LIBASHKA_CAP_FILE_READ   = 1 << 2,  /* File system reads */
+    LIBASHKA_CAP_FILE_WRITE  = 1 << 3,  /* File system writes */
+    LIBASHKA_CAP_NETWORK     = 1 << 4,  /* Network access (sockets, HTTP) */
+    LIBASHKA_CAP_ALL         = 0xFFFFFFFF
+} libashka_capability_t;
+```
+
+### 3.3 API Functions
 
 **Lifecycle:**
 ```c
+/* Create a new Isolate with all capabilities enabled.
+   Returns the Isolate thread pointer that must be passed to every
+   subsequent call targeting this context. Returns NULL on failure. */
 libashka_ctx_t *libashka_create_context(void);
+
+/* Create a new Isolate with restricted capabilities.
+   The capabilities bitmask is evaluated at SCI init time and
+   cannot be changed for the lifetime of the context. */
+libashka_ctx_t *libashka_create_context_with_capabilities(uint32_t capabilities);
+
+/* Destroy the Isolate. Before teardown this function:
+   1. Sends SIGTERM to all Pod subprocesses spawned by this context
+   2. Waits up to 3 seconds, then sends SIGKILL to any survivors
+   3. Calls waitpid() to reap every child
+   4. Frees all associated memory
+   Passing NULL is a no-op. */
 void            libashka_destroy_context(libashka_ctx_t *ctx);
+
+/* Reset the SCI state within an existing Isolate without destroying it.
+   Clears all user-defined vars, host-fn registrations, and Pod subprocesses
+   (killed with the same policy as destroy_context), then re-initialises
+   SCI to its factory state. Useful for context reuse / pooling. */
+void            libashka_reset_context(libashka_ctx_t *ctx);
 ```
 
 **Evaluation:**
 ```c
+/* Evaluate a Clojure expression string.
+   Returns a tagged union. On success the value carries the result;
+   on error the value carries a LIBASHKA_JSON string {"error": "..."}. */
 libashka_val_t  libashka_eval_string(libashka_ctx_t *ctx, const char *code);
+
+/* Read and evaluate a Clojure source file.
+   Returns the value of the last expression in the file. */
 libashka_val_t  libashka_eval_file(libashka_ctx_t *ctx, const char *path);
 ```
 
 **Bidirectional calls:**
 ```c
+/* Host → Script: call a function defined in a script namespace.
+   json_args is a JSON-encoded argument vector, e.g. "[1, \"hello\"]". */
 libashka_val_t  libashka_call_script_fn(libashka_ctx_t *ctx,
                                         const char *ns, const char *fn_name,
                                         const char *json_args);
+
+/* Script → Host: register a C function so that scripts can call it.
+   After registration the script invokes it via:
+   (host.lib/invoke "ns" "fn-name" json-args-string) */
 void            libashka_register_host_fn(libashka_ctx_t *ctx,
                                           const char *ns, const char *fn_name,
                                           libashka_host_fn_t fn_ptr);
@@ -132,35 +188,42 @@ void            libashka_register_host_fn(libashka_ctx_t *ctx,
 
 **Memory management:**
 ```c
+/* Free any heap-allocated memory inside a libashka_val_t.
+   Must be called once for every non-NIL value returned by
+   eval_string, eval_file, and call_script_fn. */
 void            libashka_free_value(libashka_val_t *val);
 ```
 
-### 3.3 Design Rationale
+### 3.4 Design Rationale
 
 - **Tagged union for primitives, JSON for composites**: Avoids complex structure mapping across FFI. int64/float64/bool/nil pass directly; vectors, maps, sets serialize to JSON strings with `LIBASHKA_JSON` tag.
+- **LIBASHKA_BINARY (future)**: Reserved tag for binary serialization formats (Transit, MessagePack, Protocol Buffers). No implementation in v1, but the enum value and union field are carved out now so the ABI does not change later.
 - **String ownership**: All returned strings are allocated on the C heap via `UnmanagedMemory.malloc()`. The caller must call `libashka_free_value` to release.
 - **Error model**: All errors caught internally, returned as `{"error": "stacktrace..."}` JSON via `LIBASHKA_JSON` type. No exceptions leak across the FFI boundary.
-- **Per-thread Isolate**: Each `libashka_ctx_t` wraps a `graal_isolatet_t*` specific to its creating thread. Contexts are fully isolated — no shared mutable state.
+- **Per-thread Isolate**: `libashka_ctx_t` is the `graal_isolatet_t*` returned by GraalVM's own isolate-creation machinery. Every `@CEntryPoint` receives it as `IsolateThread`, and GraalVM routes execution to the correct Isolate automatically. No cross-Isolate shared state.
+- **Capability model**: Host applications that embed untrusted scripts can restrict dangerous operations at context-creation time. Default (`libashka_create_context`) grants all capabilities for backward-compatibility convenience.
 
 ## 4. Java Layer
 
 ### 4.1 `LibashkaStructs.java` — C Type Mappings
 
-Uses GraalVM `@CStruct` and `@CFieldGroup` annotations to map the `libashka_val_t` C struct into Java-accessible memory layouts. This file is pure boilerplate — no business logic.
+Uses GraalVM `@CStruct`, `@CFieldGroup`, and `@CField` annotations to map the `libashka_val_t` C struct into Java-accessible memory layouts. This file is pure boilerplate — no business logic. Includes the `binary` field group (`data` + `len`) for forward compatibility.
 
 ### 4.2 `LibashkaAPI.java` — C Entry Points
 
-Six `@CEntryPoint` methods, each annotated with the corresponding C symbol name. All methods receive `IsolateThread` as the first parameter (GraalVM requirement).
+All `@CEntryPoint` methods receive `IsolateThread` as the first parameter. GraalVM uses this pointer to route the call to the correct Isolate's heap and static state.
 
 | Method | C Symbol | Responsibility |
 |--------|----------|---------------|
-| `createContext` | `libashka_create_context` | Allocate Isolate, init SCI, return ctx handle |
-| `destroyContext` | `libashka_destroy_context` | Tear down SCI, destroy Isolate, free resources |
+| `createContext` | `libashka_create_context` | Create Isolate, init SCI with `LIBASHKA_CAP_ALL`, return `IsolateThread` |
+| `createContextWithCapabilities` | `libashka_create_context_with_capabilities` | Create Isolate, parse capability mask, init SCI with restricted namespaces |
+| `destroyContext` | `libashka_destroy_context` | Kill Pod subprocesses, tear down SCI, detach Isolate |
+| `resetContext` | `libashka_reset_context` | Kill Pod subprocesses, clear SCI user state, re-init to factory state |
 | `evalString` | `libashka_eval_string` | C string → Java → delegate to Clojure → JSON → `LibashkaVal` |
 | `evalFile` | `libashka_eval_file` | Read file, eval contents, return result |
-| `registerHostFn` | `libashka_register_host_fn` | Wrap C fn pointer as `@CFunctionPointer`, store in registry |
+| `registerHostFn` | `libashka_register_host_fn` | Wrap C fn pointer as `@CFunctionPointer`, store in Isolate-local registry |
 | `callScriptFn` | `libashka_call_script_fn` | Resolve SCI ns/fn, parse JSON args, call, serialize result |
-| `freeValue` | `libashka_free_value` | `UnmanagedMemory.free()` on string fields |
+| `freeValue` | `libashka_free_value` | `UnmanagedMemory.free()` on string or binary fields |
 
 ### 4.3 Callback Interface
 
@@ -174,16 +237,17 @@ interface LibashkaHostFn extends PointerBase {
 
 When a script calls a registered host function, SCI invokes `LibashkaHostFn.invoke()`, which GraalVM routes to the original C function pointer via `@InvokeCFunctionPointer`.
 
-### 4.4 Context Storage
+### 4.4 Context Storage (Isolate-Local)
 
-```java
-private static final ConcurrentHashMap<Integer, SCIState> contexts = new ConcurrentHashMap<>();
-private static final AtomicInteger ctxCounter = new AtomicInteger(0);
-```
+Each Isolate owns a **private** `Map<String, Object>` stored via a `ThreadLocal`-style mechanism backed by `IsolateThread`. There is no global `ConcurrentHashMap` — every Isolate's heap is independent by GraalVM design, so static fields naturally hold Isolate-private values.
 
-- Thread-safe by construction (`ConcurrentHashMap`)
-- Integer keys returned as opaque `libashka_ctx_t*` handles
-- Each entry holds: `sci.ctx`, host function registry atom, and Isolate reference
+The per-Isolate state object contains:
+- `sci.ctx` — the SCI interpreter instance
+- `host-fns` — an `Atom<Map<String, LibashkaHostFn>>` for host callback registration
+- `pod-pids` — an `Atom<Set<Long>>` tracking PIDs of spawned Pod subprocesses
+- `capabilities` — the `uint32_t` capability bitmask this context was created with
+
+When capabilities restrict Pod usage (`LIBASHKA_CAP_POD` absent), `babashka.pods` namespace is omitted from SCI init and pod-pids tracking is disabled.
 
 ### 4.5 Error Handling
 
@@ -205,11 +269,16 @@ Returned as `libashka_val_t` with type `LIBASHKA_JSON` and value `{"error": "...
 
 Core namespace handling Isolate/SCI lifecycle:
 
-- `create-context []` → Allocates new SCI context via `sci/init`, registers in `ctx-registry`, returns integer context ID
-- `eval-string [ctx-id code]` → Looks up SCI context, calls `sci/eval-string`, wraps result in `{:result ...}` JSON. Catches all exceptions and returns `{:error ...}` JSON
-- `destroy-context [ctx-id]` → Removes from registry, allowing Isolate GC
+- `create-context [capabilities]` → Creates new SCI context via `sci/init`, selectively including namespaces based on the capability mask. Returns the context state map.
+- `eval-string [ctx code]` → Calls `sci/eval-string` within the context, wraps result in `{:result ...}` JSON. Catches all exceptions and returns `{:error ...}` JSON.
+- `destroy-context [ctx]` → (1) Iterates `pod-pids` atom, sends SIGTERM → 3s wait → SIGKILL → `waitpid` for each PID. (2) Clears SCI context. (3) Returns nil.
+- `reset-context [ctx]` → Same Pod cleanup as destroy, then clears all user-defined vars and host-fn registrations, re-initialises SCI namespaces to factory state.
 
-SCI initialization includes all babashka built-in namespaces, ensuring complete feature parity (including `babashka.pods`).
+SCI initialization respects the capability mask:
+- `LIBASHKA_CAP_POD` absent → omit `babashka.pods`, `clojure.java.shell`
+- `LIBASHKA_CAP_SHELL` absent → omit `babashka.tasks` shell helpers
+- `LIBASHKA_CAP_FILE_READ` / `LIBASHKA_CAP_FILE_WRITE` absent → restrict `clojure.java.io`
+- `LIBASHKA_CAP_NETWORK` absent → omit socket / HTTP namespaces
 
 ### 5.2 `libashka.serialization` — JSON Serialization
 
@@ -219,8 +288,10 @@ SCI initialization includes all babashka built-in namespaces, ensuring complete 
 
 ### 5.3 `libashka.callbacks` — Host Function Registry
 
-- `register-host-fn [ctx-id ns fn-name fn-ptr]` → Stores the `LibashkaHostFn` pointer in the context's host-fn registry atom
-- `host-fn-namespaces [ctx-id]` → Returns SCI namespace definitions that inject `host.lib/invoke` as a discoverable function for scripts. When a script calls `(host.lib/invoke "my.ns" "my-fn" json-args)`, it resolves to the corresponding C function pointer
+- `register-host-fn [ctx ns fn-name fn-ptr]` → Stores the `LibashkaHostFn` pointer in the context's Isolate-local host-fn registry atom.
+- `host-fn-namespaces [ctx]` → Returns SCI namespace definitions that inject `host.lib/invoke`. When a script calls `(host.lib/invoke "my.ns" "my-fn" json-args)`, it resolves to the corresponding C function pointer.
+
+> **Future (out of scope for v1)**: Dynamic proxy function generation so scripts can write `(my.ns/my-fn args)` directly instead of `(host.lib/invoke "my.ns" "my-fn" args)`. The current explicit dispatch is intentionally simple and zero-overhead.
 
 ### 5.4 Data Flow
 
@@ -228,26 +299,33 @@ SCI initialization includes all babashka built-in namespaces, ensuring complete 
 Host (C)                    Java (@CEntryPoint)              Clojure
 ------                      -------------------              --------
 libashka_create_context  →  createContext()             →    core/create-context
-                                ↓                              ↓
-                            创建 Isolate                   sci/init + ctx-registry
-                                ↓
-                            返回 ctx 句柄
+                                 ↓                              ↓
+                            创建 Isolate                   sci/init + cap filtering
+                                 ↓
+                            返回 IsolateThread (即 ctx 句柄)
 
-libashka_eval_string     →  evalString()                →    core/eval-string
-                                ↓                              ↓
-                            C string → Java String          sci/eval-string
-                                ↓                              ↓
+libashka_eval_string     →  evalString(thread, ...)     →    core/eval-string
+                                 ↓                              ↓
+                            路由到正确 Isolate              sci/eval-string
+                                 ↓                              ↓
                             ← JSON 字符串                ←    ser/->json
-                                ↓
+                                 ↓
                             构造 LibashkaVal → 返回给 C
 
-libashka_register_host_fn → registerHostFn()            →    cb/register-host-fn
-                                ↓                              ↓
-                            包装 C fnPtr 为 LibashkaHostFn    存入 ctx :host-fns map
-                                                               ↓
-                                                          注入 SCI 命名空间 host.lib/invoke
-                                                               ↓
-(脚本调用 host.lib/invoke) → (SCI 触发) → .invoke(fnPtr)  →  C 宿主函数
+libashka_register_host_fn → registerHostFn(thread, ...) →    cb/register-host-fn
+                                 ↓                              ↓
+                            路由到正确 Isolate              存入 ctx :host-fns atom
+                                 ↓                              ↓
+                            包装 fnPtr 为 LibashkaHostFn     注入 SCI 命名空间 host.lib/invoke
+                                                                  ↓
+(脚本调用 host.lib/invoke) → (SCI 触发) → .invoke(fnPtr) →  C 宿主函数
+
+libashka_destroy_context  →  destroyContext(thread)     →    core/destroy-context
+                                 ↓                              ↓
+                            1. SIGTERM → SIGKILL Pod 进程    遍历 pod-pids，批量清理
+                            2. 等待所有子进程退出             waitpid 回收
+                            3. 销毁 SCI 上下文
+                            4. 分离 Isolate
 ```
 
 ## 6. Build Pipeline
@@ -326,7 +404,7 @@ clean:
 
 | Layer | Location | Scope | % of tests |
 |-------|----------|-------|------------|
-| Clojure unit tests | `test/clojure/libashka/` | Context lifecycle, serialization, callbacks, Pod namespace | 55-60% |
+| Clojure unit tests | `test/clojure/libashka/` | Context lifecycle, serialization, callbacks, Pod namespace, capability filtering | 55-60% |
 | Integration tests | `test/integration/{c,zig,rust}/` | dlopen real .so, end-to-end scenarios | 15-20% |
 | Java layer | (validated indirectly via Clojure + integration) | @CEntryPoint correctness | 20-25% |
 
@@ -334,25 +412,26 @@ clean:
 
 | File | What it tests |
 |------|--------------|
-| `core_test.clj` | `create-context`, `destroy-context`, `eval-string` basic evaluation, exception capture into error JSON, multi-context isolation |
+| `core_test.clj` | `create-context` with/without capability mask, `destroy-context` Pod cleanup, `reset-context`, `eval-string` basic evaluation, exception capture, multi-context isolation |
 | `serialization_test.clj` | Clojure ↔ JSON round-trip, SCI special type safety, nil/number/string/nested structure correctness |
 | `callbacks_test.clj` | Host fn registration, script-calls-host flow, argument passing, return value propagation, unregistered-fn error |
-| `pod_test.clj` | `babashka.pods` namespace availability, Pod loading, Pod subprocess lifecycle |
+| `pod_test.clj` | `babashka.pods` namespace availability, Pod loading, Pod subprocess lifecycle, subprocess cleanup on destroy/reset, Pod namespace omitted when `LIBASHKA_CAP_POD` is absent |
 
 ### 7.3 Integration Test Scenarios (all languages)
 
 Each integration test suite (C, Zig, Rust) covers:
 
 1. `test_create_destroy` — Context creation/destruction, non-NULL verification
-2. `test_eval_simple` — `(+ 1 2)` → 3
-3. `test_eval_error` — Syntax error → `{"error": "..."}`
-4. `test_multi_contexts` — Two independent contexts, no variable cross-contamination
-5. `test_host_callback` — Register C fn, call from script, verify result
-6. `test_call_script_fn` — Host calls script-defined function
-7. `test_pod_load` — Load external Pod, call Pod function
-8. `test_pod_subprocess` — Pod spawns subprocess and communicates
-9. `test_memory_leak` — Loop create/destroy, verify no memory leak
-10. `test_thread_isolation` — Multi-threaded, each with own context, verify isolation
+2. `test_create_with_capabilities` — Restricted context creation, verify restricted operations fail
+3. `test_eval_simple` — `(+ 1 2)` → 3
+4. `test_eval_error` — Syntax error → `{"error": "..."}`
+5. `test_multi_contexts` — Two independent contexts, no variable cross-contamination
+6. `test_host_callback` — Register C fn, call from script, verify result
+7. `test_call_script_fn` — Host calls script-defined function
+8. `test_pod_load_and_cleanup` — Load external Pod, call Pod function, verify subprocess is killed on destroy
+9. `test_reset_context` — Reset context, verify state cleared, verify Pod processes killed
+10. `test_memory_leak` — Loop create/destroy, verify no memory leak
+11. `test_thread_isolation` — Multi-threaded, each with own context, verify isolation
 
 ### 7.4 TDD Execution Order
 
@@ -364,7 +443,7 @@ Each integration test suite (C, Zig, Rust) covers:
 5. RED: Write `callbacks_test.clj` → fail
 6. GREEN: Implement `libashka.callbacks` → pass
 7. RED: Write `pod_test.clj` → fail
-8. GREEN: Ensure `babashka.pods` namespace correctly injected → pass
+8. GREEN: Ensure `babashka.pods` namespace correctly injected, Pod subprocess cleanup functional → pass
 
 **Phase 2 — Java @CEntryPoint layer:**
 - Validated on JVM via Clojure tests that exercise the same code paths
@@ -380,7 +459,7 @@ Each integration test suite (C, Zig, Rust) covers:
 
 ### 8.1 Requirements
 
-- `babashka.pods` namespace must be fully available in every SCI context
+- `babashka.pods` namespace must be fully available in every SCI context (unless restricted by capability flags)
 - Pods communicate over stdin/stdout with their parent process
 - In shared-library mode, the parent process is the host application — Pod subprocess management must be preserved
 - External Pod loading via `babashka.pods/load-pod` must work
@@ -391,30 +470,45 @@ Each integration test suite (C, Zig, Rust) covers:
 - `clojure.java.shell` and process management are enabled via native-image flags:
   - `--allow-incomplete-classpath`
   - `--report-unsupported-elements-at-runtime`
-- SCI context initialization includes `babashka.pods` in the namespace map
-- Pod subprocesses inherit the host process environment; no special isolation needed beyond what babashka already provides
+- SCI context initialization includes `babashka.pods` in the namespace map unless `LIBASHKA_CAP_POD` is absent
+
+### 8.3 Pod Process Lifecycle & Cleanup
+
+Every Pod subprocess spawned by a context is tracked in a **per-context PID set** (`pod-pids` atom in the Isolate-local state). On `destroy_context` or `reset_context`:
+
+1. Iterate all tracked PIDs
+2. Send `SIGTERM` to each child process
+3. Wait up to 3 seconds for graceful shutdown
+4. Send `SIGKILL` to any survivors
+5. Call `waitpid()` on every PID to reap zombies
+6. Clear the PID set
+
+This prevents orphan/zombie Pod processes from accumulating in long-running host applications that repeatedly create and destroy contexts.
 
 ## 9. Thread Safety & Isolation
 
 ### 9.1 Per-Thread Isolate Model
 
-Each call to `libashka_create_context` creates a new GraalVM Isolate:
-- Isolates share no mutable state
-- Each Isolate has its own SCI context, heap, and host function registry
+Each call to `libashka_create_context` returns a GraalVM `IsolateThread` pointer:
+- Isolates share **no mutable state** — each has its own heap, SCI context, and host function registry
+- GraalVM's `--shared` mode includes built-in isolate-creation functions (`graal_create_isolate`) that the C host uses
 - An Isolate is bound to its creating thread (GraalVM constraint)
 
-### 9.2 Thread Safety Guarantees
+### 9.2 How It Actually Works
 
-- `ConcurrentHashMap` for context registry — safe for concurrent `createContext`/`destroyContext` calls from different threads
-- `AtomicInteger` for context ID generation — no duplicate IDs
-- Per-context `atom` for host fn registry — lock-free per-isolate mutations
-- No global mutable state outside the registry map
+GraalVM's `@CEntryPoint` mechanism works as follows in `--shared` mode:
+
+1. The compiled `.so` exports `graal_create_isolate()` — called once by the C host to create the initial Isolate
+2. Every `@CEntryPoint` method's first parameter `IsolateThread` is the pointer that GraalVM uses to route execution to the correct Isolate's heap and static variables
+3. **No global ConcurerntHashMap is needed or possible** — static fields in Java are naturally Isolate-private. Each Isolate's static `SCIState` is automatically the correct one for that Isolate
+4. The C host passes the `graal_isolatet_t*` (aliased as `libashka_ctx_t*`) to every call; GraalVM switches context transparently
 
 ### 9.3 Constraints
 
 - An Isolate cannot be shared across threads — each thread must create its own context
 - GraalVM Isolate creation has a fixed memory overhead (~few MB per Isolate)
 - The number of concurrent Isolates is limited by available memory
+- For high-frequency create/destroy patterns, use `libashka_reset_context` to reuse an Isolate instead of allocating a new one
 
 ## 10. Dependencies
 
@@ -441,7 +535,8 @@ Each call to `libashka_create_context` creates a new GraalVM Isolate:
            :test  {:extra-paths ["test/clojure"]
                    :extra-deps {io.github.cognitect-labs/test-runner
                                 {:git/url "https://github.com/cognitect-labs/test-runner"
-                                 :git/sha "..."}}}}}
+                                 :git/tag "v0.5.17"
+                                 :git/sha "9be3aee"}}}}}
 ```
 
 ## 11. Open Questions & Risks
@@ -452,13 +547,18 @@ Each call to `libashka_create_context` creates a new GraalVM Isolate:
 |------|--------|------------|
 | Babashka upstream build changes break our pipeline | High | Git submodule pinned to specific SHA; CI catches breakage |
 | GraalVM `--shared` conflicts with babashka native-image flags | Medium | libsci already validates `--shared` compatibility; test early |
-| Pod subprocess behavior differs in shared-library context | Medium | Dedicated Pod integration tests across all 3 host languages |
-| Isolate memory overhead unacceptable for high-concurrency use | Low | Document the constraint; per-thread Isolate is explicit opt-in |
-| Feature flag combination explosion | Low | Default to all features enabled; document how to trim |
+| Pod subprocess behavior differs in shared-library context | Medium | Dedicated Pod integration tests across all 3 host languages; PID tracking + mandatory cleanup |
+| Isolate memory overhead unacceptable for high-concurrency use | Low | Document the constraint; provide `reset_context` for reuse without re-allocation |
+| Feature flag combination explosion | Low | Default to all features enabled; capability mask trims dangerous ops, not build flags |
+| Host fails to call `libashka_free_value` causing memory leak | Medium | Document ownership rules in header; integration tests verify with valgrind/asan |
+| Capability model is too coarse-grained | Low | Start with 5 coarse capabilities; fine-grained policies can be added later without ABI breakage |
 
 ### 11.2 Future Considerations (out of scope for initial implementation)
 
 - CI/CD matrix builds for all platform/arch combinations
 - Pre-built binary releases (GitHub Releases)
 - Language-specific binding libraries (e.g., `zig-libashka`, `rust-libashka` crates)
-- Isolate pooling for reduced allocation overhead in high-frequency create/destroy scenarios
+- Isolate pooling with configurable pool size
+- Dynamic proxy function generation for natural `(my.ns/my-fn args)` callback syntax
+- Binary serialization backends (Transit, MessagePack) under `LIBASHKA_BINARY` tag
+- Fine-grained capability policies (e.g., filesystem path whitelist, network address allowlist)
