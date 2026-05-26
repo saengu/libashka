@@ -24,7 +24,7 @@ Public header: `include/libbabashka.h`
 - **Isolate model**: Per-thread independent GraalVM Isolates. Each Isolate owns a private SCI context and host-fn registry — no cross-Isolate shared state
 - **Isolate lifecycle**: C host creates Isolates via `libashka_create_context`, passes `graal_isolatet_t*` to every subsequent call. GraalVM routes each `@CEntryPoint` invocation to the correct Isolate automatically
 - **Data exchange**: JSON strings across the FFI boundary via `cheshire.core`
-- **Callbacks**: `@CFunctionPointer` + `@InvokeCFunctionPointer`, JSON-in / JSON-out
+- **Callbacks**: `@CFunctionPointer` + `@InvokeCFunctionPointer`. `libashka_register_host_fn(ctx, "log", "debug", fn)` dynamically interns a SCI var so scripts use natural syntax `(log/debug "hello")`. JSON-in / JSON-out under the hood.
 - **Build flow**: `babashka uberjar → native-image --shared → libbabashka.so`
 - **Pod support**: Full — preserves `babashka.pods` namespace and subprocess management, with mandatory child-process cleanup on context destroy
 
@@ -179,8 +179,13 @@ libashka_val_t  libashka_call_script_fn(libashka_ctx_t *ctx,
                                         const char *json_args);
 
 /* Script → Host: register a C function so that scripts can call it.
-   After registration the script invokes it via:
-   (host.lib/invoke "ns" "fn-name" json-args-string) */
+   Dynamically creates a SCI var in the given namespace so scripts
+   can call it with natural Clojure syntax. Example:
+     libashka_register_host_fn(ctx, "log", "debug", my_logger);
+   Afterwards the script can write:
+     (log/debug "hello")
+   Arguments are serialized to JSON, the C function receives a JSON
+   string and returns a JSON string that is parsed back into Clojure. */
 void            libashka_register_host_fn(libashka_ctx_t *ctx,
                                           const char *ns, const char *fn_name,
                                           libashka_host_fn_t fn_ptr);
@@ -221,8 +226,9 @@ All `@CEntryPoint` methods receive `IsolateThread` as the first parameter. Graal
 | `resetContext` | `libashka_reset_context` | Kill Pod subprocesses, clear SCI user state, re-init to factory state |
 | `evalString` | `libashka_eval_string` | C string → Java → delegate to Clojure → JSON → `LibashkaVal` |
 | `evalFile` | `libashka_eval_file` | Read file, eval contents, return result |
-| `registerHostFn` | `libashka_register_host_fn` | Wrap C fn pointer as `@CFunctionPointer`, store in Isolate-local registry |
+| `registerHostFn` | `libashka_register_host_fn` | Wrap C fn pointer as `@CFunctionPointer`, dynamically intern a SCI var so scripts call it natively (e.g. `(log/debug "msg")`) |
 | `callScriptFn` | `libashka_call_script_fn` | Resolve SCI ns/fn, parse JSON args, call, serialize result |
+| `unregisterHostFn` | — (internal) | Remove a previously registered host function, un-intern its SCI var |
 | `freeValue` | `libashka_free_value` | `UnmanagedMemory.free()` on string or binary fields |
 
 ### 4.3 Callback Interface
@@ -288,10 +294,37 @@ SCI initialization respects the capability mask:
 
 ### 5.3 `libashka.callbacks` — Host Function Registry
 
-- `register-host-fn [ctx ns fn-name fn-ptr]` → Stores the `LibashkaHostFn` pointer in the context's Isolate-local host-fn registry atom.
-- `host-fn-namespaces [ctx]` → Returns SCI namespace definitions that inject `host.lib/invoke`. When a script calls `(host.lib/invoke "my.ns" "my-fn" json-args)`, it resolves to the corresponding C function pointer.
+Provides the bridge from C function pointers to callable SCI vars.
 
-> **Future (out of scope for v1)**: Dynamic proxy function generation so scripts can write `(my.ns/my-fn args)` directly instead of `(host.lib/invoke "my.ns" "my-fn" args)`. The current explicit dispatch is intentionally simple and zero-overhead.
+**`register-host-fn [ctx ns fn-name fn-ptr]`**:
+1. Wraps the `LibashkaHostFn` C function pointer in a Clojure function that (a) serialises all received arguments to a JSON array via `->json`, (b) invokes the C pointer, (c) parses the returned JSON string back into Clojure data.
+2. Creates the SCI namespace `ns` if it does not already exist.
+3. Interns a var named `fn-name` in that namespace, bound to the wrapper function.
+4. After registration completes, scripts call the host function with natural Clojure syntax — no explicit dispatch string needed.
+
+**Example — C side:**
+```c
+char *my_logger(const char *json_args) {
+    printf("[HOST] %s\n", json_args);
+    return strdup("true");
+}
+libashka_register_host_fn(ctx, "log", "debug", my_logger);
+```
+
+**Example — Script side:**
+```clojure
+(log/debug "hello")         ;; → C receives "[\"hello\"]", returns true
+(log/debug "x" 42)          ;; → C receives "[\"x\",42]"
+```
+
+**`host/invoke` primitive** — The system provides a built-in `host/invoke` function as the underlying dispatch mechanism that the dynamic proxy wrappers use internally. It is also directly callable for dynamic use cases:
+```clojure
+(host/invoke "log" "debug" "hello")  ;; equivalent to (log/debug "hello")
+```
+
+**`unregister-host-fn [ctx ns fn-name]`** — Removes a previously registered host function and un-interns its SCI var.
+
+> The old design used `host.lib/invoke`; the `lib` sub-segment was dropped for conciseness. The built-in system namespace is now simply `host`.
 
 ### 5.4 Data Flow
 
@@ -314,11 +347,17 @@ libashka_eval_string     →  evalString(thread, ...)     →    core/eval-strin
 
 libashka_register_host_fn → registerHostFn(thread, ...) →    cb/register-host-fn
                                  ↓                              ↓
-                            路由到正确 Isolate              存入 ctx :host-fns atom
+                            路由到正确 Isolate              包装 fnPtr 为 wrapper fn
                                  ↓                              ↓
-                            包装 fnPtr 为 LibashkaHostFn     注入 SCI 命名空间 host.lib/invoke
+                            存储 LibashkaHostFn              在 SCI ns 中 intern var
                                                                   ↓
-(脚本调用 host.lib/invoke) → (SCI 触发) → .invoke(fnPtr) →  C 宿主函数
+(脚本直接调用 (log/debug "hello")) → wrapper fn → .invoke(fnPtr) → C 宿主函数
+                                       ↑
+                                 参数序列化为 JSON
+                                 ["hello"]
+                                       ↓
+                                 返回值解析为 Clojure 数据
+                                 C 返回 "true" → true
 
 libashka_destroy_context  →  destroyContext(thread)     →    core/destroy-context
                                  ↓                              ↓
@@ -559,6 +598,5 @@ GraalVM's `@CEntryPoint` mechanism works as follows in `--shared` mode:
 - Pre-built binary releases (GitHub Releases)
 - Language-specific binding libraries (e.g., `zig-libashka`, `rust-libashka` crates)
 - Isolate pooling with configurable pool size
-- Dynamic proxy function generation for natural `(my.ns/my-fn args)` callback syntax
 - Binary serialization backends (Transit, MessagePack) under `LIBASHKA_BINARY` tag
 - Fine-grained capability policies (e.g., filesystem path whitelist, network address allowlist)

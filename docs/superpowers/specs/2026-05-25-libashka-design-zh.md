@@ -24,7 +24,7 @@ libashka 使用 GraalVM Native Image 将 Babashka 编译为 C 可链接的共享
 - **Isolate 模型**：每线程独立 GraalVM Isolate。每个 Isolate 拥有私有的 SCI 上下文和宿主函数注册表，不跨 Isolate 共享状态
 - **Isolate 生命周期**：C 宿主通过 `libashka_create_context` 创建 Isolate，后续每次调用都传入 `graal_isolatet_t*`。GraalVM 自动将 `@CEntryPoint` 调用路由到正确的 Isolate
 - **数据交换**：通过 `cheshire.core` 以 JSON 字符串跨 FFI 边界传递
-- **回调机制**：`@CFunctionPointer` + `@InvokeCFunctionPointer`，JSON 进 / JSON 出
+- **回调机制**：`@CFunctionPointer` + `@InvokeCFunctionPointer`。`libashka_register_host_fn(ctx, "log", "debug", fn)` 动态在 SCI 中注入 var，脚本直接使用自然语法 `(log/debug "hello")`。底层自动完成 JSON 序列化/反序列化
 - **构建流程**：`babashka uberjar → native-image --shared → libbabashka.so`
 - **Pod 支持**：完整保留 `babashka.pods` 命名空间及子进程管理，上下文销毁时强制清理子进程
 - **能力模型**：宿主可通过 capability 位掩码在执行上下文级别限制 Pod、Shell、文件、网络访问
@@ -190,8 +190,13 @@ libashka_val_t  libashka_call_script_fn(libashka_ctx_t *ctx,
                                         const char *json_args);
 
 /* 脚本 → 宿主：注册 C 函数供脚本调用。
-   注册后脚本通过以下方式调用：
-   (host.lib/invoke "ns" "fn-name" json-args-string) */
+   在 SCI 中动态创建命名空间并注入 var，脚本可直接使用自然语法调用。
+   示例：
+     libashka_register_host_fn(ctx, "log", "debug", my_logger);
+   注册后脚本可直接写：
+     (log/debug "hello")
+   参数自动序列化为 JSON，C 函数接收 JSON 字符串并返回 JSON 字符串，
+   返回值自动解析为 Clojure 数据。 */
 void            libashka_register_host_fn(libashka_ctx_t *ctx,
                                           const char *ns, const char *fn_name,
                                           libashka_host_fn_t fn_ptr);
@@ -304,19 +309,37 @@ SCI 初始化根据 capability 掩码进行能力过滤：
 
 ### 5.3 `libashka.callbacks` — 宿主函数注册与调度
 
-| 函数 | 说明 |
-|------|------|
-| `register-host-fn [ctx ns fn-name fn-ptr]` | 将 `LibashkaHostFn` 指针存入上下文的 Isolate 本地注册表 atom |
-| `host-fn-namespaces [ctx]` | 返回 SCI 命名空间定义，注入 `host.lib/invoke` |
+将 C 函数指针桥接为 SCI 可调用的 var。
 
-脚本侧调用流程：
-```clojure
-;; 脚本中调用宿主函数
-(host.lib/invoke "my.ns" "my-fn" "{\"key\": \"value\"}")
-  → (查找注册表) → LibashkaHostFn.invoke(json) → C 宿主函数
+**`register-host-fn [ctx ns fn-name fn-ptr]`**：
+1. 将 `LibashkaHostFn` C 函数指针包装为一个 Clojure 函数，该包装函数 (a) 将所有接收的参数序列化为 JSON 数组，(b) 调用 C 指针，(c) 将返回的 JSON 字符串解析为 Clojure 数据
+2. 如果 SCI 命名空间 `ns` 不存在则自动创建
+3. 在该命名空间中 intern 名为 `fn-name` 的 var，绑定到包装函数
+4. 注册完成后，脚本直接使用自然 Clojure 语法调用宿主函数——无需显式 dispatch 字符串
+
+**示例 — C 侧：**
+```c
+char *my_logger(const char *json_args) {
+    printf("[HOST] %s\n", json_args);
+    return strdup("true");
+}
+libashka_register_host_fn(ctx, "log", "debug", my_logger);
 ```
 
-> **后续规划（v1 不实现）**：动态代理函数生成，使脚本可直接写成 `(my.ns/my-fn args)` 而非 `(host.lib/invoke "my.ns" "my-fn" args)`。当前显式调度方式刻意保持简单和零开销。
+**示例 — 脚本侧：**
+```clojure
+(log/debug "hello")         ;; → C 接收 "[\"hello\"]"，返回 true
+(log/debug "x" 42)          ;; → C 接收 "[\"x\",42]"
+```
+
+**`host/invoke` 底层原语** — 系统提供内置的 `host/invoke` 函数作为动态代理包装器内部使用的底层调度机制。也可直接调用以支持动态场景：
+```clojure
+(host/invoke "log" "debug" "hello")  ;; 等价于 (log/debug "hello")
+```
+
+**`unregister-host-fn [ctx ns fn-name]`** — 移除之前注册的宿主函数，un-intern 其 SCI var。
+
+> 旧设计使用 `host.lib/invoke`，去掉 `lib` 子段以简化命名。系统内置命名空间现在统一为 `host`。
 
 ### 5.4 完整数据流
 
@@ -337,13 +360,19 @@ libashka_eval_string     →   evalString(thread, ...)      →    core/eval-str
                                   ↓
                               构造 LibashkaVal → 返回给 C
 
-libashka_register_host_fn → registerHostFn(thread, ...)  →    cb/register-host-fn
+libashka_register_host_fn → registerHostFn(thread, ...) →    cb/register-host-fn
                                   ↓                               ↓
-                              路由到正确 Isolate              存入 ctx 的 :host-fns atom
+                              路由到正确 Isolate              包装 fnPtr 为 wrapper fn
                                   ↓                               ↓
-                              包装 fnPtr 为 LibashkaHostFn      注入 SCI 命名空间 host.lib/invoke
+                              存储 LibashkaHostFn              在 SCI ns 中 intern var
                                                                    ↓
-(脚本调用 host.lib/invoke)  → (SCI 触发) → .invoke(fnPtr)  →  C 宿主函数执行
+(脚本直接调用 (log/debug "hello")) → wrapper fn → .invoke(fnPtr) → C 宿主函数执行
+                                        ↑
+                                   参数序列化为 JSON
+                                   ["hello"]
+                                        ↓
+                                   返回值解析为 Clojure 数据
+                                   C 返回 "true" → true
 
 libashka_destroy_context  →  destroyContext(thread)      →    core/destroy-context
                                   ↓                               ↓
@@ -633,6 +662,5 @@ clean:
 - 预编译二进制发布（GitHub Releases）
 - 语言专用 binding 库（`zig-libashka`、`rust-libashka` crate）
 - Isolate 池化，支持可配置的池大小
-- 动态代理函数生成，实现自然的 `(my.ns/my-fn args)` 回调语法
 - 二进制序列化后端（Transit、MessagePack）接入 `LIBASHKA_BINARY` 标签
 - 细粒度能力策略（文件系统路径白名单、网络地址白名单）
